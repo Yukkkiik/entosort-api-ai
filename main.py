@@ -4,7 +4,7 @@ import os
 import time
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_model, load_dotenv
+from dotenv import load_dotenv
 from PIL import Image
 from pydantic import BaseModel
 import numpy as np
