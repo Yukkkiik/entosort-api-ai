@@ -1,6 +1,6 @@
 import base64
 import io
-import os 
+import os
 import time
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,11 +28,9 @@ IMG_SIZE = int(os.getenv("IMG_SIZE", 640))
 CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", 0.25))
 IOU_THRESHOLD = float(os.getenv("IOU_THRESHOLD", 0.45))
 ONNX_MODEL_PATH = os.getenv("ONNX_MODEL_PATH", "models/model_int8.onnx")
-PT_MODEL_PATH = os.getenv("PT_MODEL_PATH", "models/best.pt")
 
-# ---------- Lazy-loaded models ----------
+# ---------- Lazy-loaded model ----------
 _onnx_session = None
-_pt_model = None
 
 
 def get_onnx_session():
@@ -40,19 +38,18 @@ def get_onnx_session():
     if _onnx_session is None:
         import onnxruntime as ort
 
+        opts = ort.SessionOptions()
+        # Batasi thread — CPU Railway Trial/Free terbatas, thread berlebih
+        # malah bikin overhead/contention, bukan mempercepat
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
         _onnx_session = ort.InferenceSession(
-            ONNX_MODEL_PATH, providers=["CPUExecutionProvider"]
+            ONNX_MODEL_PATH, sess_options=opts, providers=["CPUExecutionProvider"]
         )
     return _onnx_session
-
-
-def get_pt_model():
-    global _pt_model
-    if _pt_model is None:
-        from ultralytics import YOLO
-
-        _pt_model = YOLO(PT_MODEL_PATH)
-    return _pt_model
 
 
 # ---------- Request / response schema ----------
@@ -65,7 +62,7 @@ class Detection(BaseModel):
     class_id: int
     class_name: str
     confidence: float
-    bbox: list[float]  
+    bbox: list[float]
 
 
 class PredictResponse(BaseModel):
@@ -200,38 +197,6 @@ def predict_onnx(req: PredictRequest):
     elapsed_ms = (time.time() - start) * 1000
 
     detections = postprocess_onnx_output(output, scale, pad_x, pad_y, req.conf)
-
-    return PredictResponse(
-        detections=detections,
-        inference_time_ms=round(elapsed_ms, 2),
-        image_width=w,
-        image_height=h,
-    )
-
-
-@app.post("/predict/pt", response_model=PredictResponse)
-def predict_pt(req: PredictRequest):
-    image = decode_base64_image(req.image_base64)
-    w, h = image.size
-
-    model = get_pt_model()
-
-    start = time.time()
-    results = model.predict(image, conf=req.conf, imgsz=IMG_SIZE, verbose=False)
-    elapsed_ms = (time.time() - start) * 1000
-
-    detections = []
-    for r in results:
-        for box in r.boxes:
-            cls_id = int(box.cls[0])
-            detections.append(
-                Detection(
-                    class_id=cls_id,
-                    class_name=CLASS_NAMES.get(cls_id, str(cls_id)),
-                    confidence=float(box.conf[0]),
-                    bbox=[float(round(v, 2)) for v in box.xyxy[0].tolist()],
-                )
-            )
 
     return PredictResponse(
         detections=detections,
