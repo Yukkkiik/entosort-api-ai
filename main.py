@@ -41,7 +41,7 @@ def get_onnx_session():
         opts = ort.SessionOptions()
         # Batasi thread — CPU Railway Trial/Free terbatas, thread berlebih
         # malah bikin overhead/contention, bukan mempercepat
-        opts.intra_op_num_threads = 4
+        opts.intra_op_num_threads = 2
         opts.inter_op_num_threads = 1
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
