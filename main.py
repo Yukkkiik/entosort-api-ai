@@ -28,8 +28,8 @@ IMG_SIZE = int(os.getenv("IMG_SIZE", 640))
 CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", 0.25))
 IOU_THRESHOLD = float(os.getenv("IOU_THRESHOLD", 0.45))
 MODEL_PATH = os.getenv("ONNX_MODEL_PATH", "models/model_int8.onnx")
-INTRA_OP_THREADS = int(os.getenv("INTRA_OP_NUM_THREADS", 2))
-INTER_OP_THREADS = int(os.getenv("INTER_OP_NUM_THREADS", 2))
+INTRA_OP_THREADS = int(os.getenv("INTRA_OP_NUM_THREADS"))
+INTER_OP_THREADS = int(os.getenv("INTER_OP_NUM_THREADS"))
 
 # ---------- Lazy-loaded ONNX session (singleton) ----------
 _session: ort.InferenceSession | None = None
@@ -39,7 +39,6 @@ def get_session() -> ort.InferenceSession:
     global _session
     if _session is None:
         opts = ort.SessionOptions()
-        # intra_op=1 -> hasil paling stabil di VPS/CPU throttled (lihat catatan deploy)
         opts.intra_op_num_threads = INTRA_OP_THREADS
         opts.inter_op_num_threads = INTER_OP_THREADS
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -174,7 +173,7 @@ def health():
     return {"status": "healthy"}
 
 
-@app.post("/predict", response_model=PredictResponse)
+@app.post("/predict/onnx", response_model=PredictResponse)
 def predict(req: PredictRequest):
     image = decode_base64_image(req.image_base64)
     w, h = image.size
