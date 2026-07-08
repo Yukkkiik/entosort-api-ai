@@ -28,8 +28,8 @@ IMG_SIZE = int(os.getenv("IMG_SIZE", 640))
 CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", 0.25))
 IOU_THRESHOLD = float(os.getenv("IOU_THRESHOLD", 0.45))
 MODEL_PATH = os.getenv("ONNX_MODEL_PATH", "models/model_int8.onnx")
-INTRA_OP_THREADS = int(os.getenv("INTRA_OP_NUM_THREADS", 1))
-INTER_OP_THREADS = int(os.getenv("INTER_OP_NUM_THREADS", 1))
+INTRA_OP_THREADS = int(os.getenv("INTRA_OP_NUM_THREADS", 2))
+INTER_OP_THREADS = int(os.getenv("INTER_OP_NUM_THREADS", 2))
 
 # ---------- Lazy-loaded ONNX session (singleton) ----------
 _session: ort.InferenceSession | None = None
