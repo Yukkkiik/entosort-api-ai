@@ -8,8 +8,8 @@ from dotenv import load_dotenv
 from PIL import Image
 from pydantic import BaseModel
 import numpy as np
+import onnxruntime as ort
 
-# Load file .env
 load_dotenv()
 
 app = FastAPI(title="EntoSort Inference API", version="1.0.0")
@@ -23,36 +23,35 @@ app.add_middleware(
 
 CLASS_NAMES = {0: "larva_active", 1: "prepupa_pupa"}
 
-# ---------- Ambil Konfigurasi dari .env ----------
+# ---------- Konfigurasi dari .env ----------
 IMG_SIZE = int(os.getenv("IMG_SIZE", 640))
 CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", 0.25))
 IOU_THRESHOLD = float(os.getenv("IOU_THRESHOLD", 0.45))
-ONNX_MODEL_PATH = os.getenv("ONNX_MODEL_PATH", "models/model_int8.onnx")
+MODEL_PATH = os.getenv("ONNX_MODEL_PATH", "models/model_int8.onnx")
+INTRA_OP_THREADS = int(os.getenv("INTRA_OP_NUM_THREADS", 1))
+INTER_OP_THREADS = int(os.getenv("INTER_OP_NUM_THREADS", 1))
 
-# ---------- Lazy-loaded model ----------
-_onnx_session = None
+# ---------- Lazy-loaded ONNX session (singleton) ----------
+_session: ort.InferenceSession | None = None
 
 
-def get_onnx_session():
-    global _onnx_session
-    if _onnx_session is None:
-        import onnxruntime as ort
-
+def get_session() -> ort.InferenceSession:
+    global _session
+    if _session is None:
         opts = ort.SessionOptions()
-        # Batasi thread — CPU Railway Trial/Free terbatas, thread berlebih
-        # malah bikin overhead/contention, bukan mempercepat
-        opts.intra_op_num_threads = 2
-        opts.inter_op_num_threads = 1
+        # intra_op=1 -> hasil paling stabil di VPS/CPU throttled (lihat catatan deploy)
+        opts.intra_op_num_threads = INTRA_OP_THREADS
+        opts.inter_op_num_threads = INTER_OP_THREADS
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
-        _onnx_session = ort.InferenceSession(
-            ONNX_MODEL_PATH, sess_options=opts, providers=["CPUExecutionProvider"]
+        _session = ort.InferenceSession(
+            MODEL_PATH, sess_options=opts, providers=["CPUExecutionProvider"]
         )
-    return _onnx_session
+    return _session
 
 
-# ---------- Request / response schema ----------
+# ---------- Schema ----------
 class PredictRequest(BaseModel):
     image_base64: str
     conf: float = CONF_THRESHOLD
@@ -78,8 +77,7 @@ def decode_base64_image(image_base64: str) -> Image.Image:
         if "," in image_base64 and image_base64.strip().startswith("data:"):
             image_base64 = image_base64.split(",", 1)[1]
         image_bytes = base64.b64decode(image_base64)
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        return image
+        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Base64 gambar tidak valid: {e}")
 
@@ -107,7 +105,6 @@ def xywh_to_xyxy_original(cx, cy, w, h, scale, pad_x, pad_y):
 
 
 def nms(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float):
-    """Simple NMS, tanpa dependency tambahan."""
     if len(boxes) == 0:
         return []
     x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
@@ -130,8 +127,7 @@ def nms(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float):
     return keep
 
 
-def postprocess_onnx_output(output: np.ndarray, scale, pad_x, pad_y, conf_threshold: float):
-    # output shape: [1, 6, 8400] -> transpose ke [8400, 6]
+def postprocess(output: np.ndarray, scale, pad_x, pad_y, conf_threshold: float):
     preds = output[0].T  # [8400, 4 + num_classes]
     boxes_xywh = preds[:, :4]
     class_scores = preds[:, 4:]
@@ -144,6 +140,9 @@ def postprocess_onnx_output(output: np.ndarray, scale, pad_x, pad_y, conf_thresh
     class_ids = class_ids[mask]
     confidences = confidences[mask]
 
+    if len(boxes_xywh) == 0:
+        return []
+
     boxes_xyxy = np.array(
         [
             xywh_to_xyxy_original(cx, cy, w, h, scale, pad_x, pad_y)
@@ -151,22 +150,17 @@ def postprocess_onnx_output(output: np.ndarray, scale, pad_x, pad_y, conf_thresh
         ]
     )
 
-    if len(boxes_xyxy) == 0:
-        return []
-
     keep = nms(boxes_xyxy, confidences, IOU_THRESHOLD)
 
-    detections = []
-    for idx in keep:
-        detections.append(
-            Detection(
-                class_id=int(class_ids[idx]),
-                class_name=CLASS_NAMES.get(int(class_ids[idx]), str(class_ids[idx])),
-                confidence=float(confidences[idx]),
-                bbox=[float(round(v, 2)) for v in boxes_xyxy[idx]],
-            )
+    return [
+        Detection(
+            class_id=int(class_ids[idx]),
+            class_name=CLASS_NAMES.get(int(class_ids[idx]), str(class_ids[idx])),
+            confidence=float(confidences[idx]),
+            bbox=[float(round(v, 2)) for v in boxes_xyxy[idx]],
         )
-    return detections
+        for idx in keep
+    ]
 
 
 # ---------- Endpoints ----------
@@ -180,8 +174,8 @@ def health():
     return {"status": "healthy"}
 
 
-@app.post("/predict/onnx", response_model=PredictResponse)
-def predict_onnx(req: PredictRequest):
+@app.post("/predict", response_model=PredictResponse)
+def predict(req: PredictRequest):
     image = decode_base64_image(req.image_base64)
     w, h = image.size
 
@@ -189,14 +183,14 @@ def predict_onnx(req: PredictRequest):
     img_array = np.array(canvas).astype(np.float32) / 255.0
     img_array = img_array.transpose(2, 0, 1)[np.newaxis, :]  # NCHW
 
-    session = get_onnx_session()
+    session = get_session()
     input_name = session.get_inputs()[0].name
 
     start = time.time()
     output = session.run(None, {input_name: img_array})[0]
     elapsed_ms = (time.time() - start) * 1000
 
-    detections = postprocess_onnx_output(output, scale, pad_x, pad_y, req.conf)
+    detections = postprocess(output, scale, pad_x, pad_y, req.conf)
 
     return PredictResponse(
         detections=detections,
